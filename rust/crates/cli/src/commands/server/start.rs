@@ -10,7 +10,8 @@ use owo_colors::OwoColorize;
 use pay_core::PaymentState;
 use pay_core::accounts::AccountsStore;
 use pay_core::server::session::SessionMpp;
-use pay_types::metering::{ApiSpec, OperatorConfig, SignerConfig};
+use pay_core::server::telemetry::FeePayerWallet;
+use pay_types::metering::{ApiSpec, OperatorConfig, RoutingConfig, SignerConfig};
 use solana_mpp::server::Mpp;
 use solana_mpp::solana_keychain::SolanaSigner;
 use solana_mpp::solana_keychain::memory::MemorySigner;
@@ -54,6 +55,24 @@ pub struct StartCommand {
     /// Automatically enabled in sandbox mode (`pay --sandbox server start`).
     #[arg(long)]
     pub debugger: bool,
+
+    /// Export traces and metrics to an OTLP HTTP sidecar at HOST:PORT.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub otlp_sidecar: Option<String>,
+
+    /// Path to an OpenAPI 3 or Google Discovery JSON document that
+    /// describes the upstream API. When set, the server exposes the spec at
+    /// `GET /openapi.json` with `rootUrl` (Discovery) and/or `servers[].url`
+    /// (OpenAPI 3) rewritten to point at the proxy itself, so downstream
+    /// agents can drive the proxy without knowing the upstream URL.
+    #[arg(long, value_name = "PATH")]
+    pub openapi: Option<String>,
+
+    /// Override the public base URL used when rewriting `rootUrl` /
+    /// `servers[].url` in the served `/openapi.json`. When omitted, the URL
+    /// is derived from the request's `Host` header at serve time.
+    #[arg(long, value_name = "URL")]
+    pub public_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -62,6 +81,7 @@ struct AppState {
     mpps: Vec<Mpp>,
     session_mpp: Option<Arc<SessionMpp>>,
     browser_rpc_url: Option<String>,
+    fee_payer_wallet: Option<FeePayerWallet>,
 }
 
 impl PaymentState for AppState {
@@ -80,6 +100,9 @@ impl PaymentState for AppState {
     fn session_mpp(&self) -> Option<&SessionMpp> {
         self.session_mpp.as_deref()
     }
+    fn fee_payer_wallet(&self) -> Option<&FeePayerWallet> {
+        self.fee_payer_wallet.as_ref()
+    }
 }
 
 impl StartCommand {
@@ -91,6 +114,43 @@ impl StartCommand {
 
         let api: ApiSpec = serde_yml::from_str(&contents)
             .map_err(|e| pay_core::Error::Config(format!("Invalid spec: {e}")))?;
+
+        // Optional OpenAPI / Discovery doc — loaded once, filtered to the
+        // YAML's `endpoints[]` allow-list, and exposed at `GET /openapi.json`
+        // with `rootUrl` / `servers[].url` rewritten per-request from the
+        // `Host` header (or `--public-url` when set).
+        let openapi_doc: Option<Arc<serde_json::Value>> = match &self.openapi {
+            Some(input) => {
+                let source = if input.starts_with("http://") || input.starts_with("https://") {
+                    pay_types::registry::OpenapiSource::Url {
+                        url: input.to_string(),
+                    }
+                } else {
+                    pay_types::registry::OpenapiSource::Path {
+                        path: input.to_string(),
+                    }
+                };
+                let spec_dir = std::path::Path::new(expanded.as_ref())
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let mut doc = pay_core::server::openapi::load_document(&source, spec_dir)?;
+                pay_core::server::openapi::filter_to_endpoints(&mut doc, &api.endpoints);
+                // Drop schemas/parameters/responses no surviving operation
+                // references — for heavily-trimmed proxies (e.g. bigquery
+                // 47 endpoints → 2) this cuts the served openapi size from
+                // hundreds of KB to a handful.
+                pay_core::server::openapi::prune_unused_components(&mut doc);
+                // Strip upstream-auth metadata (OAuth2 scopes etc.) — the
+                // proxy handles upstream credentials internally; surfacing
+                // them on /openapi.json misleads agents into attaching
+                // tokens the proxy won't use.
+                pay_core::server::openapi::strip_upstream_auth(&mut doc);
+                Some(Arc::new(doc))
+            }
+            None => None,
+        };
+        let openapi_proxy_mode = matches!(api.routing, RoutingConfig::Proxy { .. });
+        let public_url_override = self.public_url.clone();
 
         // Apply env vars from spec (static values or ${VAR} passthrough).
         // SAFETY: called before any threads are spawned.
@@ -597,6 +657,17 @@ impl StartCommand {
                 );
             }
 
+            let fee_payer_wallet = if fee_payer {
+                fee_payer_signer.as_ref().map(|signer| {
+                    FeePayerWallet::new(rpc_url.clone(), signer.pubkey().to_string())
+                })
+            } else {
+                None
+            };
+            if let Some(ref wallet) = fee_payer_wallet {
+                wallet.observe("startup", &api.subdomain, "__startup").await;
+            }
+
             eprintln!(
                 "  {}",
                 format!(
@@ -679,6 +750,7 @@ impl StartCommand {
                 mpps,
                 session_mpp,
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
+                fee_payer_wallet,
             };
 
             let pdb_state = if debugger {
@@ -713,6 +785,21 @@ impl StartCommand {
                         gateway_verify(verify_mpps.clone(), body.0, verify_pdb.as_ref()).await
                     }),
                 );
+
+            if let Some(doc) = openapi_doc.clone() {
+                let public_override = public_url_override.clone();
+                let proxy_mode = openapi_proxy_mode;
+                app = app.route(
+                    "/openapi.json",
+                    get(move |headers: axum::http::HeaderMap| {
+                        let doc = doc.clone();
+                        let public_override = public_override.clone();
+                        async move {
+                            serve_openapi(doc, proxy_mode, public_override.as_deref(), &headers)
+                        }
+                    }),
+                );
+            }
 
             if let Some(ref pdb) = pdb_state {
                 app = app
@@ -893,6 +980,49 @@ fn build_pdb_config(
             "oauth": free,
         }
     })
+}
+
+/// Serve the configured OpenAPI / Discovery document at `/openapi.json`.
+///
+/// When the spec's `routing` is `proxy` we rewrite `rootUrl` /
+/// `servers[].url` to the public URL of *this* server so callers can drive
+/// the proxy directly from the spec. The public URL comes from
+/// `--public-url` if set, else from the request's `Host` header.
+fn serve_openapi(
+    doc: Arc<serde_json::Value>,
+    proxy_mode: bool,
+    public_override: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> Response {
+    let mut out = (*doc).clone();
+    if proxy_mode {
+        let public_url = public_override
+            .map(str::to_string)
+            .unwrap_or_else(|| derive_public_url_from_host(headers));
+        pay_core::server::openapi::rewrite_urls(&mut out, &public_url);
+    }
+    axum::Json(out).into_response()
+}
+
+fn derive_public_url_from_host(headers: &axum::http::HeaderMap) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost:1402");
+    // `x-forwarded-proto` if present (Cloud Run sets it to `https`); else
+    // assume http for localhost-shaped hosts and https for everything else.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+                "http".to_string()
+            } else {
+                "https".to_string()
+            }
+        });
+    format!("{scheme}://{host}")
 }
 
 async fn browser_rpc_proxy(

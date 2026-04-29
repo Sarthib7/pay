@@ -4,6 +4,9 @@ pub mod accounting;
 pub mod metering;
 
 #[cfg(feature = "server")]
+pub mod openapi;
+
+#[cfg(feature = "server")]
 pub mod payment;
 
 #[cfg(feature = "server")]
@@ -11,5 +14,8 @@ pub mod proxy;
 
 #[cfg(feature = "server")]
 pub mod session;
+
+#[cfg(feature = "server")]
+pub mod telemetry;
 
 pub use accounting::{AccountingKey, AccountingStore, InMemoryStore, current_period};

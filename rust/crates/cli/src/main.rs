@@ -2,6 +2,7 @@ mod commands;
 pub mod components;
 pub mod debugger_proxy;
 mod no_dna;
+mod observability;
 mod output;
 pub mod tui;
 
@@ -24,7 +25,8 @@ struct Opts {
     #[clap(subcommand)]
     command: Command,
 
-    /// Automatically pay 402 challenges without prompting (no cap).
+    /// Automatically satisfy 402 challenges after the user approves a spending
+    /// cap; Pay enforces the cap and stops before the budget can be exceeded.
     /// Implied when NO_DNA is set.
     #[arg(long)]
     yolo: bool,
@@ -91,7 +93,8 @@ fn main() {
         return;
     }
 
-    init_logging(config.log_format, opts.verbose);
+    let otlp_sidecar = opts.command.otlp_sidecar().map(str::to_owned);
+    let _otel_guard = init_logging(config.log_format, opts.verbose, otlp_sidecar.as_deref());
 
     // ── Debugger proxy ─────────────────────────────────────────────────────
     //
@@ -229,9 +232,27 @@ fn main() {
     }
 }
 
-fn init_logging(log_format: LogFormat, verbose: bool) {
-    let default = if verbose { "pay=info,warn" } else { "warn" };
+fn init_logging(
+    log_format: LogFormat,
+    verbose: bool,
+    otlp_sidecar: Option<&str>,
+) -> Option<observability::OtelGuard> {
+    let default = if verbose || otlp_sidecar.is_some() {
+        "pay=info,warn"
+    } else {
+        "warn"
+    };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+
+    if let Some(sidecar) = otlp_sidecar {
+        return match observability::init_otlp(sidecar, filter) {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                eprintln!("{}", format!("Error: {err}").dimmed());
+                std::process::exit(1);
+            }
+        };
+    }
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -245,6 +266,7 @@ fn init_logging(log_format: LogFormat, verbose: bool) {
             builder.json().init();
         }
     }
+    None
 }
 
 /// Find a usable keypair, or tell the user to run `pay setup`.

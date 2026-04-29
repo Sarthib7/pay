@@ -14,6 +14,7 @@
 
 pub mod build;
 pub mod config;
+pub mod openapi;
 pub mod probe;
 
 use std::collections::BTreeMap;
@@ -756,11 +757,13 @@ fn find_service<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a Service> {
 ///
 /// Downloads `{base_url}/providers/{fqn}.json`, caches locally in
 /// `~/.config/pay/skills/detail/`, uses `sha` for invalidation.
-pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<Vec<Endpoint>> {
+pub async fn load_service_endpoints(
+    catalog: &Catalog,
+    service_name: &str,
+) -> Result<Vec<Endpoint>> {
     let svc = find_service(catalog, service_name)
         .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
 
-    // Already loaded?
     if svc.endpoints_loaded() {
         return Ok(svc.endpoints.clone());
     }
@@ -772,8 +775,6 @@ pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<V
     }
 
     let detail_url = format!("{}/providers/{}.json", catalog.base_url, svc.fqn);
-
-    // Check local cache
     let cache_dir =
         std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
     let cache_file = cache_dir.join(format!("{}.json", svc.sha));
@@ -785,39 +786,58 @@ pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<V
         return Ok(detail.endpoints);
     }
 
-    // Fetch from CDN
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| Error::Config(format!("http client: {e}")))?;
-
-    let resp = client
-        .get(&detail_url)
-        .send()
-        .map_err(|e| Error::Config(format!("fetch {detail_url}: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(Error::Config(format!(
-            "{detail_url} returned {}",
-            resp.status()
-        )));
-    }
-
-    let raw = resp
-        .text()
-        .map_err(|e| Error::Config(format!("read {detail_url}: {e}")))?;
-
+    let raw = fetch_url(&detail_url).await?;
     let detail = parse_detail(&raw)?;
 
-    // Cache it
     let _ = std::fs::create_dir_all(&cache_dir);
     let _ = std::fs::write(&cache_file, &raw);
 
     Ok(detail.endpoints)
 }
 
+/// Load the inlined OpenAPI document for `service_name` from the catalog's
+/// detail JSON (cached locally after the first fetch).
+///
+/// Returns `None` when the provider was published with inline `endpoints:`
+/// (no openapi source), or when the build couldn't parse the source doc.
+/// Returns `Some(value)` for providers whose spec declared
+/// `openapi: { url: ... }` — the document is embedded verbatim in the
+/// detail JSON so consumers don't need a follow-up HTTP fetch.
+pub async fn load_service_openapi(
+    catalog: &Catalog,
+    service_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let svc = find_service(catalog, service_name)
+        .ok_or_else(|| Error::Config(format!("service `{service_name}` not found")))?;
+
+    if catalog.base_url.is_empty() {
+        return Err(Error::Config(
+            "no base_url in catalog — cannot fetch openapi detail".into(),
+        ));
+    }
+
+    let detail_url = format!("{}/providers/{}.json", catalog.base_url, svc.fqn);
+    let cache_dir =
+        std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
+    let cache_file = cache_dir.join(format!("{}.json", svc.sha));
+
+    if cache_file.exists()
+        && let Ok(raw) = std::fs::read_to_string(&cache_file)
+        && let Ok(detail) = parse_detail(&raw)
+    {
+        return Ok(detail.openapi_doc);
+    }
+
+    let raw = fetch_url(&detail_url).await?;
+    let detail = parse_detail(&raw)?;
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let _ = std::fs::write(&cache_file, &raw);
+
+    Ok(detail.openapi_doc)
+}
+
 /// Convenience: load endpoints and inject them into the catalog's service.
-pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
+pub async fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
     let base_url = catalog.base_url.clone();
     let idx = catalog
         .providers
@@ -843,8 +863,6 @@ pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()>
     }
 
     let detail_url = format!("{}/providers/{}.json", base_url, svc.fqn);
-
-    // Check local cache
     let cache_dir =
         std::path::PathBuf::from(shellexpand::tilde("~/.config/pay/skills/detail").into_owned());
     let cache_file = cache_dir.join(format!("{}.json", svc.sha));
@@ -858,27 +876,7 @@ pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()>
         return Ok(());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| Error::Config(format!("http client: {e}")))?;
-
-    let resp = client
-        .get(&detail_url)
-        .send()
-        .map_err(|e| Error::Config(format!("fetch {detail_url}: {e}")))?;
-
-    if !resp.status().is_success() {
-        return Err(Error::Config(format!(
-            "{detail_url} returned {}",
-            resp.status()
-        )));
-    }
-
-    let raw = resp
-        .text()
-        .map_err(|e| Error::Config(format!("read {detail_url}: {e}")))?;
-
+    let raw = fetch_url(&detail_url).await?;
     let detail = parse_detail(&raw)?;
     let _ = std::fs::create_dir_all(&cache_dir);
     let _ = std::fs::write(&cache_file, &raw);
@@ -886,7 +884,6 @@ pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()>
     svc.endpoints = detail.endpoints;
     svc.content = detail.content;
 
-    // Clean up stale detail files not referenced by current index
     clean_stale_detail_cache(catalog);
 
     Ok(())
@@ -920,6 +917,16 @@ struct ProviderDetailFile {
     endpoints: Vec<Endpoint>,
     #[serde(default)]
     content: Option<String>,
+    /// Pointer to the upstream OpenAPI doc (preserved for traceability).
+    #[serde(default)]
+    #[allow(dead_code)]
+    openapi: Option<pay_types::registry::OpenapiSource>,
+    /// Inlined OpenAPI / Discovery document, populated at build time when
+    /// the spec declared `openapi: { url: ... }`. Lets MCP / CLI consumers
+    /// access the upstream schema right after `pay skills update` without
+    /// hitting the network again.
+    #[serde(default)]
+    openapi_doc: Option<serde_json::Value>,
 }
 
 fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
@@ -930,7 +937,7 @@ fn parse_detail(raw: &str) -> Result<ProviderDetailFile> {
 
 /// Load the skills catalog. Uses cache if fresh, otherwise fetches from
 /// configured sources.
-pub fn load_skills() -> Result<Catalog> {
+pub async fn load_skills() -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
 
     // Cache hit?
@@ -941,7 +948,7 @@ pub fn load_skills() -> Result<Catalog> {
     }
 
     // Cache miss — fetch, merge, cache.
-    match fetch_and_merge(&cfg, false) {
+    match fetch_and_merge(&cfg, false).await {
         Ok(catalog) => {
             let _ = write_cache(&cfg, &catalog);
             cfg.clean_stale_caches();
@@ -971,21 +978,20 @@ pub fn load_skills() -> Result<Catalog> {
 /// Force-refresh: fetch all sources, merge, write cache.
 /// When `cache_bust` is true, append `?v=<timestamp>` to source URLs
 /// to bypass CDN edge caches, and purge all local detail caches.
-pub fn update_skills(cache_bust: bool) -> Result<Catalog> {
+pub async fn update_skills(cache_bust: bool) -> Result<Catalog> {
     let cfg = config::SkillsConfig::load()?;
-    let catalog = fetch_and_merge(&cfg, cache_bust)?;
+    let catalog = fetch_and_merge(&cfg, cache_bust).await?;
     write_cache(&cfg, &catalog)?;
     cfg.clean_stale_caches();
     if cache_bust {
-        // Purge all detail caches so endpoints are re-fetched with fresh shas.
         clean_stale_detail_cache(&catalog);
     }
     Ok(catalog)
 }
 
 /// Fetch each source URL and merge all providers into one Catalog.
-fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catalog> {
-    let client = reqwest::blocking::Client::builder()
+async fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catalog> {
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| Error::Config(format!("http client: {e}")))?;
@@ -1004,7 +1010,7 @@ fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catal
         } else {
             source.url.clone()
         };
-        match fetch_one(&client, &url) {
+        match fetch_one_async(&client, &url).await {
             Ok(cat) => {
                 if base_url.is_empty() && !cat.base_url.is_empty() {
                     base_url = cat.base_url.clone();
@@ -1030,10 +1036,11 @@ fn fetch_and_merge(cfg: &config::SkillsConfig, cache_bust: bool) -> Result<Catal
     })
 }
 
-fn fetch_one(client: &reqwest::blocking::Client, url: &str) -> Result<Catalog> {
+async fn fetch_one_async(client: &reqwest::Client, url: &str) -> Result<Catalog> {
     let resp = client
         .get(url)
         .send()
+        .await
         .map_err(|e| Error::Config(format!("fetch {url}: {e}")))?;
 
     if !resp.status().is_success() {
@@ -1045,8 +1052,69 @@ fn fetch_one(client: &reqwest::blocking::Client, url: &str) -> Result<Catalog> {
 
     let raw = resp
         .text()
+        .await
         .map_err(|e| Error::Config(format!("read {url}: {e}")))?;
     parse_catalog(&raw)
+}
+
+/// Shared async HTTP fetch used by detail/endpoint/openapi loaders.
+async fn fetch_url(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| Error::Config(format!("http client: {e}")))?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| Error::Config(format!("fetch {url}: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(Error::Config(format!("{url} returned {}", resp.status())));
+    }
+
+    resp.text()
+        .await
+        .map_err(|e| Error::Config(format!("read {url}: {e}")))
+}
+
+/// Sync wrappers for CLI callers that don't have a tokio runtime.
+pub mod blocking {
+    use super::*;
+
+    pub fn load_skills() -> Result<Catalog> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::load_skills())
+    }
+
+    pub fn update_skills(cache_bust: bool) -> Result<Catalog> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::update_skills(cache_bust))
+    }
+
+    pub fn ensure_endpoints(catalog: &mut Catalog, service_name: &str) -> Result<()> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::ensure_endpoints(catalog, service_name))
+    }
+
+    pub fn load_service_endpoints(catalog: &Catalog, service_name: &str) -> Result<Vec<Endpoint>> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::load_service_endpoints(catalog, service_name))
+    }
+
+    pub fn load_service_openapi(
+        catalog: &Catalog,
+        service_name: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        tokio::runtime::Runtime::new()
+            .map_err(|e| Error::Config(format!("runtime: {e}")))?
+            .block_on(super::load_service_openapi(catalog, service_name))
+    }
 }
 
 fn parse_catalog(raw: &str) -> Result<Catalog> {
@@ -2045,30 +2113,29 @@ mod tests {
         assert!(cat.providers[0].endpoints_loaded());
     }
 
-    #[test]
-    fn ensure_endpoints_skips_when_already_loaded() {
+    #[tokio::test]
+    async fn ensure_endpoints_skips_when_already_loaded() {
         let mut cat = catalog_with_endpoints();
-        // Already has endpoints — ensure_endpoints should be a no-op
         let count_before = cat.providers[0].endpoints.len();
-        let result = ensure_endpoints(&mut cat, "bigquery");
+        let result = ensure_endpoints(&mut cat, "bigquery").await;
         assert!(result.is_ok());
         assert_eq!(cat.providers[0].endpoints.len(), count_before);
     }
 
-    #[test]
-    fn ensure_endpoints_fails_without_base_url() {
+    #[tokio::test]
+    async fn ensure_endpoints_fails_without_base_url() {
         let mut cat = catalog_index_only();
-        cat.base_url = String::new(); // no base_url
-        let result = ensure_endpoints(&mut cat, "bigquery");
+        cat.base_url = String::new();
+        let result = ensure_endpoints(&mut cat, "bigquery").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("base_url"));
     }
 
-    #[test]
-    fn ensure_endpoints_fails_for_unknown_service() {
+    #[tokio::test]
+    async fn ensure_endpoints_fails_for_unknown_service() {
         let mut cat = catalog_index_only();
-        let result = ensure_endpoints(&mut cat, "nonexistent");
+        let result = ensure_endpoints(&mut cat, "nonexistent").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not found"));
