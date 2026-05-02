@@ -11,6 +11,7 @@ pub mod skills;
 pub mod solana;
 pub mod topup;
 pub mod wget;
+pub mod whoami;
 
 use clap::Subcommand;
 use owo_colors::OwoColorize;
@@ -39,11 +40,15 @@ pub enum Command {
     /// Run Codex with 402 payment support.
     Codex(codex::CodexCommand),
     /// Manage accounts (new, import, list, destroy, export).
+    /// With no subcommand, lists accounts and prints the available subcommands.
     #[command(alias = "accounts")]
     Account {
         #[command(subcommand)]
-        command: account::AccountCommand,
+        command: Option<account::AccountCommand>,
     },
+    /// Show the system user, the active mainnet account, and its stablecoin
+    /// balances.
+    Whoami(whoami::WhoamiCommand),
     /// Run a Solana CLI command with your pay account keypair.
     Solana(solana::SolanaCommand),
     /// Send SOL to a recipient address.
@@ -89,6 +94,36 @@ impl Command {
         }
     }
 
+    /// Whether this command needs a configured pay account before it can
+    /// run usefully. Used by `main` to auto-run `pay setup` on a fresh
+    /// install when the user invokes a payment-bearing command directly
+    /// (e.g. `npx @solana/pay claude "buy me some flowers"`).
+    ///
+    /// Setup itself, account-management subcommands, and informational
+    /// commands (whoami, skills, mcp, server) are excluded — they either
+    /// don't need an account or handle the missing-account case
+    /// gracefully on their own.
+    pub fn requires_account(&self) -> bool {
+        match self {
+            Command::Curl(_)
+            | Command::Wget(_)
+            | Command::Http(_)
+            | Command::Fetch(_)
+            | Command::Claude(_)
+            | Command::Codex(_)
+            | Command::Solana(_)
+            | Command::Send(_)
+            | Command::Topup(_) => true,
+            Command::Setup(_)
+            | Command::Account { .. }
+            | Command::Whoami(_)
+            | Command::Skills { .. }
+            | Command::Install(_)
+            | Command::Server { .. }
+            | Command::Mcp => false,
+        }
+    }
+
     /// Which tool this command wraps.
     #[allow(dead_code)] // used by session budget TUI (currently disabled)
     pub fn tool_kind(&self) -> ToolKind {
@@ -100,6 +135,7 @@ impl Command {
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
             Command::Account { .. }
+            | Command::Whoami(_)
             | Command::Skills { .. }
             | Command::Install(_)
             | Command::Send(_)
@@ -137,7 +173,11 @@ impl Command {
             .unwrap_or_else(|_| "pay".to_string());
 
         match self {
-            Command::Account { command } => return command.run(keypair_override),
+            Command::Account { command } => match command {
+                Some(cmd) => return cmd.run(),
+                None => return account::run_default(),
+            },
+            Command::Whoami(cmd) => return cmd.run(),
             Command::Skills { command } => return command.run(),
             Command::Install(cmd) => return cmd.run(),
             Command::Solana(cmd) => std::process::exit(cmd.run(keypair_override)?),
